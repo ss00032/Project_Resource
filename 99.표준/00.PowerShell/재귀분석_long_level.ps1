@@ -37,6 +37,10 @@ $excludeSearchSchemas = @("S_CBK")
 #  - 같은 이름의 원천 외에 다른 원천이 하나라도 있으면 분석대상이다
 $skipOneToOne = $true
 
+# 최초타겟에서 제외할 문자 (테이블명에 아래 문자가 들어 있으면 최초타겟에서 뺀다. 원천으로 나올 때는 그대로 표시)
+$excludeRootChars = @("#")
+
+
 #---------------------------------------------------------------
 # 함수
 #---------------------------------------------------------------
@@ -281,6 +285,7 @@ finally {
 $fileSources   = @{}     # 파일명 -> 원천 목록 (Key = 스키마.테이블, Table = 테이블명)
 $fileTargetSch = @{}     # 파일명 -> 타겟스키마 목록 (모수 제외 판단용)
 $fileFirstTgt  = @{}     # 파일명 -> 첫 타겟테이블명 (파일명에서 테이블을 못 찾을 때 대비)
+$fileTgts      = @{}     # 파일명 -> 타겟테이블명 목록 (타겟1~3, 중복 제거)
 $knownTables   = @{}     # 엑셀에 나오는 모든 테이블명
 $seenSrc       = @{}
 $fileList      = New-Object System.Collections.ArrayList
@@ -293,6 +298,7 @@ for ($r = 1; $r -le $nRows; $r++) {
     if (-not $fileSources.ContainsKey($file)) {
         $fileSources[$file]   = New-Object System.Collections.ArrayList
         $fileTargetSch[$file] = New-Object System.Collections.ArrayList
+        $fileTgts[$file]      = New-Object System.Collections.ArrayList
         [void]$fileList.Add($file)
     }
 
@@ -321,6 +327,7 @@ for ($r = 1; $r -le $nRows; $r++) {
             $knownTables[$tb] = $true
             [void]$fileTargetSch[$file].Add($tgtSch)
             if (-not $fileFirstTgt.ContainsKey($file)) { $fileFirstTgt[$file] = $tb }
+            if (-not $fileTgts[$file].Contains($tb)) { [void]$fileTgts[$file].Add($tb) }
         }
     }
 }
@@ -331,16 +338,18 @@ $fileTableMap = @{}
 $passFiles    = @{}      # 1:1 복사 파일 (분석대상 아님)
 $noTable      = 0
 foreach ($f in $fileList) {
-    $t = Get-FileTable $f
-    if (-not $t -and $fileFirstTgt.ContainsKey($f)) { $t = $fileFirstTgt[$f] }
-    if (-not $t) { $noTable++; continue }
+    # 이 파일이 만드는 테이블 = 타겟테이블명(타겟1~3 전부)
+    $tlist = @($fileTgts[$f])
+    if ($tlist.Count -eq 0) { $noTable++; continue }
 
-    $fileTableMap[$f] = $t
-    if (-not $byTable.ContainsKey($t)) { $byTable[$t] = New-Object System.Collections.ArrayList }
-    [void]$byTable[$t].Add($f)
+    $fileTableMap[$f] = $tlist[0]
+    foreach ($t in $tlist) {
+        if (-not $byTable.ContainsKey($t)) { $byTable[$t] = New-Object System.Collections.ArrayList }
+        if (-not $byTable[$t].Contains($f)) { [void]$byTable[$t].Add($f) }
+    }
 
-    # 원천이 1개뿐이고 그 원천이 타겟과 같은 테이블명이면 1:1
-    if ($skipOneToOne -and $fileSources[$f].Count -eq 1 -and $fileSources[$f][0].Table -eq $t) {
+    # 원천이 1개뿐이고 그 원천이 타겟 중 하나와 같은 테이블명이면 1:1
+    if ($skipOneToOne -and $fileSources[$f].Count -eq 1 -and ($tlist -contains $fileSources[$f][0].Table)) {
         $passFiles[$f] = $true
     }
 }
@@ -348,6 +357,9 @@ foreach ($f in $fileList) {
 # 최초타겟 목록
 $roots = New-Object System.Collections.ArrayList
 foreach ($t in ($byTable.Keys | Sort-Object)) {
+    $skipRoot = $false
+    foreach ($ch in $excludeRootChars) { if ($ch -and $t.Contains($ch)) { $skipRoot = $true; break } }
+    if ($skipRoot) { continue }          # 테이블명에 # 등이 있으면 최초타겟 제외
     $keep = $false
     foreach ($f in $byTable[$t]) {
         if ($passFiles.ContainsKey($f)) { continue }          # 1:1 복사 파일은 최초타겟에서도 제외
@@ -397,7 +409,7 @@ foreach ($t in $roots) {
     }
 
     $rootCnt++
-    if ($rootCnt % 50 -eq 0) { Write-Host "  재귀 분석 ... $rootCnt / $($roots.Count) (누적 $($results.Count) 행)" }
+    Write-Host "  [$rootCnt / $($roots.Count)] $t (누적 $($results.Count)) $(Get-Date -Format HH:mm:ss)"
 }
 
 Write-Host "재귀 분석 결과 : $($results.Count) 행"
@@ -454,7 +466,6 @@ try {
             }
 
             $rng = $sh.Range($sh.Cells.Item($outRow, 1), $sh.Cells.Item($outRow + $n - 1, $colCnt))
-            $rng.NumberFormat = "@"          # 텍스트로 (테이블명이 숫자/날짜로 바뀌는 것 방지)
             # 1차: COM 직접 호출로 배열 쓰기 / 2차: 일반 대입 / 3차: 한 칸씩 쓰기
             $ok = $false
             try {
@@ -497,9 +508,9 @@ try {
     $wb.Close($false)
 }
 finally {
-    if ($wb) { try { $wb.Close($false) } catch {} ; [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($wb) }
-    if ($sh) { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($sh) }
-    if ($xl) { $xl.Quit(); [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($xl) }
+    if ($wb) { try { $wb.Close($false) } catch {} ; try { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($wb) } catch {} }
+    if ($sh) { try { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($sh) } catch {} }
+    if ($xl) { try { $xl.Quit() } catch {} ; try { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($xl) } catch {} }
     [GC]::Collect(); [GC]::WaitForPendingFinalizers()
 }
 
