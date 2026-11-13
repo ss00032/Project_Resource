@@ -37,6 +37,14 @@ $excludeSearchSchemas = @("S_CBK")
 #  - 같은 이름의 원천 외에 다른 원천이 하나라도 있으면 분석대상이다
 $skipOneToOne = $true
 
+# 최초타겟에서 제외할 문자 (테이블명에 아래 문자가 들어 있으면 최초타겟에서 뺀다. 원천으로 나올 때는 그대로 표시)
+$excludeRootChars = @("#")
+
+# 이미 펼친 테이블이 다시 나오면 펼치지 않고 " (*)" 를 붙여 끝낸다 (경로 폭발 방지)
+# 엑셀 저장 시 " (*)" 칸에 처음 펼친 위치로 이동하는 하이퍼링크를 건다
+$makeLinks = $true
+
+
 #---------------------------------------------------------------
 # 함수
 #---------------------------------------------------------------
@@ -170,6 +178,22 @@ function Walk {
 
     if ($state.RootStop) { return }
 
+    # 같은 최초타겟 안에서 이미 펼친 테이블이면 더 내려가지 않고 " (*)" 표시 후 끝
+    if ($Nodes.Count -gt 0) {
+        if ($expandedKeys.ContainsKey($CurKey)) {
+            $n2 = @($Nodes)
+            $n2[$n2.Count - 1] = $n2[$n2.Count - 1] + " (*)"
+            $before = $results.Count
+            Emit-Path -Root $Root -Nodes $n2
+            if ($results.Count -gt $before) {
+                $tg = $expandedKeys[$CurKey]
+                [void]$links.Add(@($before, $Nodes.Count, $tg[0], $tg[1]))   # 결과행, 컬럼, 이동할 행, 이동할 컬럼
+            }
+            return
+        }
+        $expandedKeys[$CurKey] = @($results.Count, $Nodes.Count)             # 처음 펼친 위치
+    }
+
     $expanded = $false
 
     if ($Nodes.Count -lt $maxLevel -and $byTable.ContainsKey($Table) -and -not (Test-SearchExcluded $CurKey)) {
@@ -281,6 +305,7 @@ finally {
 $fileSources   = @{}     # 파일명 -> 원천 목록 (Key = 스키마.테이블, Table = 테이블명)
 $fileTargetSch = @{}     # 파일명 -> 타겟스키마 목록 (모수 제외 판단용)
 $fileFirstTgt  = @{}     # 파일명 -> 첫 타겟테이블명 (파일명에서 테이블을 못 찾을 때 대비)
+$fileTgts      = @{}     # 파일명 -> 타겟테이블명 목록 (타겟1~3, 중복 제거)
 $knownTables   = @{}     # 엑셀에 나오는 모든 테이블명
 $seenSrc       = @{}
 $fileList      = New-Object System.Collections.ArrayList
@@ -293,6 +318,7 @@ for ($r = 1; $r -le $nRows; $r++) {
     if (-not $fileSources.ContainsKey($file)) {
         $fileSources[$file]   = New-Object System.Collections.ArrayList
         $fileTargetSch[$file] = New-Object System.Collections.ArrayList
+        $fileTgts[$file]      = New-Object System.Collections.ArrayList
         [void]$fileList.Add($file)
     }
 
@@ -321,6 +347,7 @@ for ($r = 1; $r -le $nRows; $r++) {
             $knownTables[$tb] = $true
             [void]$fileTargetSch[$file].Add($tgtSch)
             if (-not $fileFirstTgt.ContainsKey($file)) { $fileFirstTgt[$file] = $tb }
+            if (-not $fileTgts[$file].Contains($tb)) { [void]$fileTgts[$file].Add($tb) }
         }
     }
 }
@@ -331,16 +358,18 @@ $fileTableMap = @{}
 $passFiles    = @{}      # 1:1 복사 파일 (분석대상 아님)
 $noTable      = 0
 foreach ($f in $fileList) {
-    $t = Get-FileTable $f
-    if (-not $t -and $fileFirstTgt.ContainsKey($f)) { $t = $fileFirstTgt[$f] }
-    if (-not $t) { $noTable++; continue }
+    # 이 파일이 만드는 테이블 = 타겟테이블명(타겟1~3 전부)
+    $tlist = @($fileTgts[$f])
+    if ($tlist.Count -eq 0) { $noTable++; continue }
 
-    $fileTableMap[$f] = $t
-    if (-not $byTable.ContainsKey($t)) { $byTable[$t] = New-Object System.Collections.ArrayList }
-    [void]$byTable[$t].Add($f)
+    $fileTableMap[$f] = $tlist[0]
+    foreach ($t in $tlist) {
+        if (-not $byTable.ContainsKey($t)) { $byTable[$t] = New-Object System.Collections.ArrayList }
+        if (-not $byTable[$t].Contains($f)) { [void]$byTable[$t].Add($f) }
+    }
 
-    # 원천이 1개뿐이고 그 원천이 타겟과 같은 테이블명이면 1:1
-    if ($skipOneToOne -and $fileSources[$f].Count -eq 1 -and $fileSources[$f][0].Table -eq $t) {
+    # 원천이 1개뿐이고 그 원천이 타겟 중 하나와 같은 테이블명이면 1:1
+    if ($skipOneToOne -and $fileSources[$f].Count -eq 1 -and ($tlist -contains $fileSources[$f][0].Table)) {
         $passFiles[$f] = $true
     }
 }
@@ -348,6 +377,9 @@ foreach ($f in $fileList) {
 # 최초타겟 목록
 $roots = New-Object System.Collections.ArrayList
 foreach ($t in ($byTable.Keys | Sort-Object)) {
+    $skipRoot = $false
+    foreach ($ch in $excludeRootChars) { if ($ch -and $t.Contains($ch)) { $skipRoot = $true; break } }
+    if ($skipRoot) { continue }          # 테이블명에 # 등이 있으면 최초타겟 제외
     $keep = $false
     foreach ($f in $byTable[$t]) {
         if ($passFiles.ContainsKey($f)) { continue }          # 1:1 복사 파일은 최초타겟에서도 제외
@@ -365,6 +397,8 @@ $results  = New-Object System.Collections.ArrayList
 $state    = @{ RootRows = 0; RootStop = $false; AllStop = $false; MaxDepth = 0 }
 $truncated = New-Object System.Collections.ArrayList
 $seenPath = @{}
+$expandedKeys = @{}
+$links    = New-Object System.Collections.ArrayList
 $rootCnt  = 0
 
 foreach ($t in $roots) {
@@ -373,13 +407,14 @@ foreach ($t in $roots) {
     $state.RootRows = 0
     $state.RootStop = $false
     $seenPath = @{}
+    $expandedKeys = @{}
 
     Walk -Root $t -Table $t -Nodes @() -UsedFiles @() -CurKey $t
 
     if ($state.RootStop) { [void]$truncated.Add($t) }
 
     $rootCnt++
-    if ($rootCnt % 50 -eq 0) { Write-Host "  재귀 분석 ... $rootCnt / $($roots.Count) (누적 $($results.Count) 행)" }
+    Write-Host "  [$rootCnt / $($roots.Count)] $t : $($state.RootRows) 행 (누적 $($results.Count)) $(Get-Date -Format HH:mm:ss)"
 }
 
 Write-Host "재귀 분석 결과 : $($results.Count) 행 / 최대 LEVEL $($state.MaxDepth)"
@@ -443,7 +478,6 @@ try {
             }
 
             $rng = $sh.Range($sh.Cells.Item($outRow, 1), $sh.Cells.Item($outRow + $n - 1, $colCnt))
-            $rng.NumberFormat = "@"          # 텍스트로 (테이블명이 숫자/날짜로 바뀌는 것 방지)
             # 1차: COM 직접 호출로 배열 쓰기 / 2차: 일반 대입 / 3차: 한 칸씩 쓰기
             $ok = $false
             try {
@@ -481,14 +515,34 @@ try {
         for ($c = 1; $c -le $colCnt; $c++) { $sh.Columns.Item($c).ColumnWidth = 30 }
     } while ($pos -lt $total)
 
+    # 하이퍼링크 : " (*)" 칸 -> 처음 펼친 칸 (같은 시트 안 이동, HYPERLINK 수식은 개수 제한 없음)
+    if ($makeLinks -and $links.Count -gt 0) {
+        $sh1 = $wb.Worksheets.Item(1)
+        $k = 0
+        foreach ($L in $links) {
+            if ($L[0] -ge $sheetMax -or $L[2] -ge $sheetMax) { continue }     # 첫 시트 안의 행만
+            $anchor = $sh1.Cells.Item($L[0] + 2, $L[1] + 1)
+            $dest   = $sh1.Cells.Item($L[2] + 2, $L[3] + 1)
+            $addr   = $dest.Address($false, $false)
+            $txt    = ([string]$results[$L[0]][$L[1]]).Replace('"', '""')
+
+            $anchor.Formula = '=HYPERLINK("#' + $addr + '","' + $txt + '")'
+            try { $anchor.Font.Color = 16711680 } catch {}      # 파란색
+            try { $anchor.Font.Underline = 2 } catch {}         # 밑줄
+
+            $k++
+            if ($k % 5000 -eq 0) { Write-Host "  하이퍼링크 ... $k / $($links.Count)" }
+        }
+    }
+
     if (Test-Path $outputXlsx) { Remove-Item $outputXlsx -Force }
     $wb.SaveAs($outputXlsx, 51)      # 51 = xlsx
     $wb.Close($false)
 }
 finally {
-    if ($wb) { try { $wb.Close($false) } catch {} ; [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($wb) }
-    if ($sh) { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($sh) }
-    if ($xl) { $xl.Quit(); [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($xl) }
+    if ($wb) { try { $wb.Close($false) } catch {} ; try { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($wb) } catch {} }
+    if ($sh) { try { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($sh) } catch {} }
+    if ($xl) { try { $xl.Quit() } catch {} ; try { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($xl) } catch {} }
     [GC]::Collect(); [GC]::WaitForPendingFinalizers()
 }
 
